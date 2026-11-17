@@ -38,12 +38,25 @@ Fallback: if fewer than 3 comparables have a usable curve for an hour,
 that hour falls back to the house baseline shape (flat at p1 with a
 log-spread widening as 0.15*sqrt(h-1)).
 
+Flat-regime shrinkage: for large hour-1 prints the whole per-hour
+log-quantile vector is shifted toward the flat baseline (log-ratio 0) by
+up to 20% of the median's distance from flat, ramping in over
+ln(hour-1) 10..12.  Big hour-1 launches stay flat -- their late-day
+log-ratio falls almost one-for-one with hour-1 scale (corr -0.94) --
+while small hour-1 launches explode as timezones unlock, so the
+shrinkage is scale-gated and small launches are untouched.
+
 Local backtest (leave-one-out pseudo-cases built from the 37 usable
 comparables, each scored against its own hours 2..24 with the contest's
-pinball loss on the log scale): median loss 0.249 over all 37 launches,
-0.194 over the 27 midnight-local-like launches with hour-1 >= 20k
-(GTA VI's regime), versus the house baseline's 0.325 / 0.256 on the same
-pseudo-cases.  Mean loss 0.403 vs baseline 0.930 overall.
+pinball loss on the log scale, x2 convention): median loss 0.242 over
+all 37 launches, 0.196 over the 27 midnight-local-like launches with
+hour-1 >= 20k (GTA VI's regime), versus the house baseline's 0.325 /
+0.256 on the same pseudo-cases.  Mean loss 0.403 vs baseline 0.930
+overall.  Before the shrinkage the median was 0.249 (mean 0.403); the
+flat-curve launches improved -- Monster Hunter Wilds 0.464 -> 0.458,
+Starfield 0.359 -> 0.333, Marvel Rivals 0.244 -> 0.227, Diablo IV
+0.138 -> 0.121 (now beating its baseline 0.126) -- and the model beats
+the baseline on 34 of 37 launches.
 
 Deterministic: no randomness, fixed iteration order (files in name order,
 comparables in file order, sorted values for quantiles).  Standard
@@ -67,6 +80,13 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 BANDWIDTH = 1.0
 # Minimum comparable curves needed per hour before falling back.
 MIN_CURVES = 3
+# Flat-regime shrinkage (see forecast_case): how far the log-quantile
+# vector is pulled toward the flat baseline (log-ratio 0), as a fraction of
+# the median's distance from flat, for large hour-1 prints.  It ramps from
+# 0 at ln(p1) = 10 to SHRINK_MAX at ln(p1) = 12 and stays there.
+SHRINK_MAX = 0.20
+SHRINK_LOGP1_LO = 10.0
+SHRINK_LOGP1_HI = 12.0
 # Fallback log-spread per sqrt hour, as in the house baseline.
 FALLBACK_SIGMA = 0.15
 # Standard normal quantiles at the scored levels (fallback only).
@@ -141,6 +161,21 @@ def forecast_case(case, name):
     p1 = float(p1)
     log_p1 = math.log(p1)
 
+    # Flat-regime shrinkage.  Across the comparables, a launch's late-day
+    # log-ratio falls almost one-for-one with its hour-1 scale (corr -0.94
+    # between ln(hour-1) and the hour-20 log-ratio): tiny hour-1 launches
+    # explode as timezones unlock, while big hour-1 launches stay flat --
+    # Monster Hunter Wilds, Starfield, Diablo IV and Marvel Rivals all sit
+    # near log-ratio 0 all day, and the unshrunk median curve (which climbs
+    # to +0.4/+0.5 late) loses to the flat house baseline on all four.
+    # So for large hour-1 prints the whole per-hour log-quantile vector is
+    # shifted toward the flat baseline by a fraction of the median's
+    # distance from flat.  The fraction ramps in over ln(p1) 10..12, so
+    # small hour-1 launches (the exploders) are untouched.
+    shrink_frac = SHRINK_MAX * max(
+        0.0, min(1.0, (log_p1 - SHRINK_LOGP1_LO) / (SHRINK_LOGP1_HI - SHRINK_LOGP1_LO))
+    )
+
     # Per-comparable log-ratio curves, weighted by hour-1 scale similarity.
     curves = []  # [(weight, [log-ratio for hours 2..24])]
     for comp in case.get("comparables") or []:
@@ -160,7 +195,12 @@ def forecast_case(case, name):
     for i in range(23):
         pairs = [(ratios[i], w) for w, ratios in curves if ratios[i] is not None]
         if len(pairs) >= MIN_CURVES:
-            log_q.append([weighted_quantile(pairs, tau) for tau in LEVELS])
+            raw = [weighted_quantile(pairs, tau) for tau in LEVELS]
+            # Shift the whole vector toward flat by shrink_frac of the
+            # median's distance from 0; the spread around the median is
+            # carried along unchanged.
+            shift = -shrink_frac * raw[2]
+            log_q.append([x + shift for x in raw])
         else:
             h = i + 2
             log_q.append([z * FALLBACK_SIGMA * math.sqrt(h - 1) for z in Z])
